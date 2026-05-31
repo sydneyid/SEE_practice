@@ -130,8 +130,16 @@ class ParallelLaunch:
         )
         # 3. if test only
         if self.config.TEST_ONLY:
+            if len(val_dataset) == 0:
+                raise ValueError(
+                    "TEST_ONLY requires a non-empty validation/test dataset. "
+                    "Extract TESTING_GROUPS under DATASET.root (see see_dataset.py)."
+                )
             self.valid(val_loader, model, criterion, metrics, 0)
             return
+        has_val = len(val_dataset) > 0
+        if not has_val:
+            info("No validation/test data; training will skip validation epochs.")
         # 4. train
         min_loss = 123456789.0
         for epoch in range(self.config.START_EPOCH, self.config.END_EPOCH):
@@ -148,11 +156,12 @@ class ParallelLaunch:
             # valid
             if epoch % self.config.VAL_INTERVAL == 0:
                 torch.save(checkpoint, path)
-                val_loss = self.valid(val_loader, model, criterion, metrics, epoch)
-                if val_loss < min_loss:
-                    min_loss = val_loss
-                    copy_path = join(self.config.SAVE_DIR, "model_best.pth.tar")
-                    shutil.copy(path, copy_path)
+                if has_val:
+                    val_loss = self.valid(val_loader, model, criterion, metrics, epoch)
+                    if val_loss < min_loss:
+                        min_loss = val_loss
+                        copy_path = join(self.config.SAVE_DIR, "model_best.pth.tar")
+                        shutil.copy(path, copy_path)
             # train
             if epoch % self.config.MODEL_SANING_INTERVAL == 0:
                 path = join(

@@ -1,3 +1,7 @@
+# SEE-Net: train on indoor RoboticArm only; validate on official indoor test groups.
+# Indoor test IDs (held out): 000, 001, 002, 006, 012, 018, 030, 042, 048, 054, 060, 065, 070, 074, 075
+# Training uses other indoor folders (003-005, 007-011, 013-017, ... 099) — not outdoor (100+).
+
 JOBS: 24
 TEST_ONLY: false
 LOG_INTERVAL: 10
@@ -31,7 +35,9 @@ METRICS:
   - NAME: SSIM
 DATASET:
   NAME: see_everything_everytime_dataset
-  root: /content/drive/MyDrive/SEE_Dataset
+  root: ./SEE-600K/RoboticArm/
+  train_scenario_filter: indoor
+  val_scenario_filter: indoor
   in_frames: 1
   crop_h: 128
   crop_w: 256
@@ -75,6 +81,6 @@ MODEL:
       windows_size: 4
 VISUALIZATION:
   folder: ./vis
-  tag: SEENet_SDE-ae3-96-4-8-4-loss-2-epoch-20-using-cascade
+  tag: SEENet-indoor-only
   intermediate_visualization: false
   ONLY_VIS: false

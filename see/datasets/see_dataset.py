@@ -21,6 +21,20 @@ from see.datasets.basic_batch import EVENT_LOW_LIGHT_BATCH as ELBC
 from see.datasets.basic_batch import get_ev_low_light_batch
 from see.utils.event_representation_builder import EventRepresentationBuilder
 
+
+class _EmptyDataset(Dataset):
+    def __len__(self):
+        return 0
+
+    def __getitem__(self, index):
+        raise IndexError(index)
+
+
+def _concat_or_empty(datasets):
+    if len(datasets) == 0:
+        return _EmptyDataset()
+    return ConcatDataset(datasets)
+
 """
 video_name-0:
 video_name-1:
@@ -331,18 +345,59 @@ def get_see_everything_everytime_with_event_dataset_for_each_group(
     return dataset
 
 
+def group_numeric_id(group_name: str) -> int:
+    return int(group_name.split("-", 1)[0])
+
+
+def is_indoor_group(group_name: str) -> bool:
+    """RoboticArm indoor scenes use IDs 000-099 (e.g. 003-indoor, 072-indoor-AAAI)."""
+    return group_numeric_id(group_name) < 100
+
+
+def is_outdoor_group(group_name: str) -> bool:
+    return group_numeric_id(group_name) >= 100
+
+
+def _scenario_matches_filter(group_name: str, scenario_filter: str | None) -> bool:
+    if scenario_filter is None or scenario_filter in ("all", ""):
+        return True
+    if scenario_filter == "indoor":
+        return is_indoor_group(group_name)
+    if scenario_filter == "outdoor":
+        return is_outdoor_group(group_name)
+    raise ValueError(f"Unknown scenario_filter: {scenario_filter!r} (use 'all', 'indoor', or 'outdoor')")
+
+
 def get_see_everything_everytime_with_event_dataset_all(
-    root, in_frames, crop_h, crop_w, ev_rep_cfg, testing_mapping_type, training_mapping_type, sample_step
+    root,
+    in_frames,
+    crop_h,
+    crop_w,
+    ev_rep_cfg,
+    testing_mapping_type,
+    training_mapping_type,
+    sample_step,
+    train_scenario_filter=None,
+    val_scenario_filter=None,
 ):
     all_train_dataset, all_test_dataset = [], []
-    # video_all_folder = join(root, "VIDEOS-ALL")
-    # video_all_text = join(root, "videos_all.txt")
-    video_all_folder = root
+    video_all_folder = os.path.abspath(root)
+    if not isdir(video_all_folder):
+        raise ValueError(
+            f"DATASET.root does not exist: {video_all_folder}\n"
+            "On Colab, use root: ./SEE-600K/RoboticArm/ and download SEE-600K into the repo."
+        )
+    if train_scenario_filter or val_scenario_filter:
+        info(
+            f"Scenario filters: train={train_scenario_filter or 'all'}, val={val_scenario_filter or 'all'}"
+        )
 
     for group in sorted(listdir(video_all_folder)):
         group_folder = join(video_all_folder, group)
         if isdir(group_folder):
             if group in TESTING_GROUPS:
+                if not _scenario_matches_filter(group, val_scenario_filter):
+                    continue
                 dataset_in_one_group = get_see_everything_everytime_with_event_dataset_for_each_group(
                     group_folder,
                     in_frames,
@@ -358,6 +413,8 @@ def get_see_everything_everytime_with_event_dataset_all(
                     continue
                 all_test_dataset.extend(dataset_in_one_group)
             else:
+                if not _scenario_matches_filter(group, train_scenario_filter):
+                    continue
                 dataset_in_one_group = get_see_everything_everytime_with_event_dataset_for_each_group(
                     group_folder,
                     in_frames,
@@ -374,15 +431,54 @@ def get_see_everything_everytime_with_event_dataset_all(
                 all_train_dataset.extend(dataset_in_one_group)
     info(f"all_test_dataset: {len(all_test_dataset)}")
     info(f"all_train_dataset: {len(all_train_dataset)}")
-    return ConcatDataset(all_train_dataset), ConcatDataset(all_test_dataset)
+    if len(all_test_dataset) == 0:
+        has_archives = any(
+            isfile(join(video_all_folder, name)) and name.endswith(".tar.gz")
+            for name in listdir(video_all_folder)
+        )
+        if has_archives:
+            warn(
+                "No test/val samples: test groups may still be .tar.gz only. "
+                "Training can continue; use TEST_ONLY after extracting TESTING_GROUPS."
+            )
+        else:
+            warn(
+                f"No test/val samples under {video_all_folder}. "
+                "Training can continue; inference (TEST_ONLY) needs test group folders."
+            )
+    if len(all_train_dataset) == 0:
+        raise ValueError(
+            f"No training samples under {video_all_folder}. "
+            "Extract non-test RoboticArm group folders (all groups not in TESTING_GROUPS)."
+        )
+    return _concat_or_empty(all_train_dataset), _concat_or_empty(all_test_dataset)
 
 
 """
 CONFIG of the dataset
 """
 
-TESTING_GROUPS = [
+# Official indoor test split (must not be used for training).
+INDOOR_TESTING_GROUPS = [
     "000-indoor_ceiling_table_light",
+    "001-indoor_wall_displayboard_wood_luggage",
+    "002-indoor_trophy_shelf_wall",
+    "006-indoor_shot",
+    "012-indoor",
+    "018-indoor",
+    "030-indoor",
+    "042-indoor",
+    "048-indoor",
+    "054-indoor",
+    "060-indoor",
+    "065-indoor",
+    "070-indoor",
+    "074-indoor-ResolutionBoard",
+    "075-indoor-ICLR",
+]
+
+TESTING_GROUPS = [
+    *INDOOR_TESTING_GROUPS,
     "001-indoor_wall_displayboard_wood_luggage",
     "002-indoor_trophy_shelf_wall",
     "006-indoor_shot",
