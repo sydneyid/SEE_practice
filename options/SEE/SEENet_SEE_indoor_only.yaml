@@ -35,7 +35,7 @@ METRICS:
   - NAME: SSIM
 DATASET:
   NAME: see_everything_everytime_dataset
-  root: ./SEE-600K/RoboticArm/
+  root: /content/drive/MyDrive/SEE_Dataset
   train_scenario_filter: indoor
   val_scenario_filter: indoor
   in_frames: 1
