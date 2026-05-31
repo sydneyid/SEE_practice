@@ -368,6 +368,12 @@ def _scenario_matches_filter(group_name: str, scenario_filter: str | None) -> bo
     raise ValueError(f"Unknown scenario_filter: {scenario_filter!r} (use 'all', 'indoor', or 'outdoor')")
 
 
+def _group_has_required_metadata(group_folder: str) -> bool:
+    return isfile(join(group_folder, "registrate_result.json")) and isfile(
+        join(group_folder, "exposure_state.json")
+    )
+
+
 def get_see_everything_everytime_with_event_dataset_all(
     root,
     in_frames,
@@ -394,41 +400,48 @@ def get_see_everything_everytime_with_event_dataset_all(
 
     for group in sorted(listdir(video_all_folder)):
         group_folder = join(video_all_folder, group)
-        if isdir(group_folder):
-            if group in TESTING_GROUPS:
-                if not _scenario_matches_filter(group, val_scenario_filter):
-                    continue
-                dataset_in_one_group = get_see_everything_everytime_with_event_dataset_for_each_group(
-                    group_folder,
-                    in_frames,
-                    crop_h,
-                    crop_w,
-                    ev_rep_cfg,
-                    is_training=False,
-                    mapping_type=testing_mapping_type,
-                    sample_step=sample_step,
-                )
-                if len(dataset_in_one_group) == 0:
-                    info(f"Empty Group (Testing) : {group_folder}")
-                    continue
-                all_test_dataset.extend(dataset_in_one_group)
-            else:
-                if not _scenario_matches_filter(group, train_scenario_filter):
-                    continue
-                dataset_in_one_group = get_see_everything_everytime_with_event_dataset_for_each_group(
-                    group_folder,
-                    in_frames,
-                    crop_h,
-                    crop_w,
-                    ev_rep_cfg,
-                    is_training=True,
-                    mapping_type=training_mapping_type,
-                    sample_step=sample_step,
-                )
-                if len(dataset_in_one_group) == 0:
-                    debug(f"Empty Group (Training): {group_folder}")
-                    continue
-                all_train_dataset.extend(dataset_in_one_group)
+        if not isdir(group_folder):
+            continue
+        if group in TESTING_GROUPS:
+            if not _scenario_matches_filter(group, val_scenario_filter):
+                continue
+            if not _group_has_required_metadata(group_folder):
+                warn(f"Skip Group (Testing, incomplete): {group_folder}")
+                continue
+            dataset_in_one_group = get_see_everything_everytime_with_event_dataset_for_each_group(
+                group_folder,
+                in_frames,
+                crop_h,
+                crop_w,
+                ev_rep_cfg,
+                is_training=False,
+                mapping_type=testing_mapping_type,
+                sample_step=sample_step,
+            )
+            if len(dataset_in_one_group) == 0:
+                info(f"Empty Group (Testing) : {group_folder}")
+                continue
+            all_test_dataset.extend(dataset_in_one_group)
+        else:
+            if not _scenario_matches_filter(group, train_scenario_filter):
+                continue
+            if not _group_has_required_metadata(group_folder):
+                warn(f"Skip Group (Training, incomplete): {group_folder}")
+                continue
+            dataset_in_one_group = get_see_everything_everytime_with_event_dataset_for_each_group(
+                group_folder,
+                in_frames,
+                crop_h,
+                crop_w,
+                ev_rep_cfg,
+                is_training=True,
+                mapping_type=training_mapping_type,
+                sample_step=sample_step,
+            )
+            if len(dataset_in_one_group) == 0:
+                info(f"Empty Group (Training): {group_folder}")
+                continue
+            all_train_dataset.extend(dataset_in_one_group)
     info(f"all_test_dataset: {len(all_test_dataset)}")
     info(f"all_train_dataset: {len(all_train_dataset)}")
     if len(all_test_dataset) == 0:

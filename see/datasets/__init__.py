@@ -24,6 +24,8 @@ def get_dataset(config):
             testing_mapping_type=config.testing_mapping_type,
             training_mapping_type=config.training_mapping_type,
             sample_step=config.sample_step,
+            train_scenario_filter=getattr(config, "train_scenario_filter", None),
+            val_scenario_filter=getattr(config, "val_scenario_filter", None),
         )
     else:
         raise ValueError(f"Unknown dataset: {config.NAME}")
