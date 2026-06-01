@@ -39,10 +39,14 @@ def init_config(yaml_path):
     with open(yaml_path, "r") as f:
         config = yaml.safe_load(f)
     # 0. logging
-    os.makedirs(FLAGS.log_dir, exist_ok=True)
+    log_dir = os.path.abspath(os.path.expanduser(FLAGS.log_dir.strip()))
+    os.makedirs(log_dir, exist_ok=True)
+    FLAGS.log_dir = log_dir
     logging.set_verbosity(logging.DEBUG)
-    info(f"log_dir: {FLAGS.log_dir}")
-    logging.get_absl_handler().use_absl_log_file()
+    info(f"log_dir (absolute): {FLAGS.log_dir}")
+    info(f"SAVE_DIR (checkpoints): {FLAGS.log_dir}")
+    info(f"  -> checkpoint.pth.tar after each epoch completes (not during batches)")
+    logging.get_absl_handler().use_absl_log_file(log_dir=FLAGS.log_dir)
     config["SAVE_DIR"] = FLAGS.log_dir
     # 1. Resume
     if FLAGS.RESUME_PATH:

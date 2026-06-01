@@ -73,8 +73,9 @@ class ParallelLaunch:
         opt = Optimizer(self.config.OPTIMIZER, model)
         # 1. Build model
         if self.config.IS_CUDA:
-            model = nn.DataParallel(model)
             model = model.cuda()
+            if torch.cuda.device_count() > 1:
+                model = nn.DataParallel(model)
             criterion = criterion.cuda()
             metrics = metrics.cuda()
 

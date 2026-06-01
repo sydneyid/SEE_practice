@@ -48,5 +48,16 @@ def get_model(config):
             exposure_sample_num=config.exposure_sample_num,
             SEE_config=config.SEE_config,
         )
+    elif config.NAME == "SEENetPath2":
+        from see.models.see_net_path2 import SEENetPath2
+
+        return SEENetPath2(
+            frames=config.input_frames,
+            moments=config.event_moments,
+            C1=config.C1,
+            C2=config.C2,
+            loop=config.loop,
+            SEE_config=config.SEE_config,
+        )
     else:
         raise ValueError(f"Unknown model: {config.NAME}")
