@@ -25,6 +25,22 @@ from see.models.see_net import (
 from see.utils.model_size import model_size
 
 
+class ConvRefineFuse(nn.Module):
+    """Lightweight conv fusion of refine features with encoder output (no attention)."""
+
+    def __init__(self, C2):
+        super().__init__()
+        self.fuse = nn.Sequential(
+            nn.Conv2d(C2 * 2, C2, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(C2, C2, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, feat, light_inr):
+        return self.fuse(torch.cat([feat, light_inr], dim=1))
+
+
 def _exposure_ratio_schedule(num_steps, ratio_max, schedule="linspace", device=None):
     """ED-style discrete exposure ratios from 1 -> ratio_max (inclusive endpoints)."""
     if num_steps <= 0:
@@ -61,21 +77,33 @@ class ExposureStepCondition(nn.Module):
 class ExposureRefineStep(nn.Module):
     """
     One refinement step: current RGB + optional LL anchor + step embed,
-    fused with SEE sparse features and events.
+    fused with SEE sparse features and a precomputed event guide.
     """
 
-    def __init__(self, C1, C2, sparse_encoder_config, concat_origin=True, adaptive_res_and_x0=True):
+    def __init__(
+        self,
+        C2,
+        refine_backbone="conv",
+        refine_encoder_config=None,
+        concat_origin=True,
+        adaptive_res_and_x0=True,
+    ):
         super().__init__()
         self.concat_origin = concat_origin
         self.adaptive_res_and_x0 = adaptive_res_and_x0
+        self.refine_backbone = refine_backbone
         rgb_in = 6 if concat_origin else 3
         self.rgb_to_feat = nn.Conv2d(rgb_in, C2, kernel_size=1, stride=1, padding=0, bias=False)
-        self.ev_to_feat = nn.Conv2d(C1, C2, kernel_size=1, stride=1, padding=0, bias=False)
         self.step_to_feat = nn.Conv2d(C2, C2, kernel_size=1, stride=1, padding=0, bias=False)
-        cfg = sparse_encoder_config
-        self.fuse = SwinTransformerDecoderBlock(
-            dim=C2, depth=cfg.depth, heads=cfg.heads, windows_size=cfg.windows_size
-        )
+        if refine_backbone == "conv":
+            self.fuse = ConvRefineFuse(C2)
+        elif refine_backbone == "swin":
+            cfg = refine_encoder_config
+            self.fuse = SwinTransformerDecoderBlock(
+                dim=C2, depth=cfg.depth, heads=cfg.heads, windows_size=cfg.windows_size
+            )
+        else:
+            raise ValueError(f"Unknown refine_backbone: {refine_backbone}")
         out_ch = 7 if adaptive_res_and_x0 else 3
         self.feat_to_rgb = nn.Conv2d(C2, out_ch, kernel_size=1, stride=1, padding=0, bias=False)
         if not adaptive_res_and_x0:
@@ -86,13 +114,12 @@ class ExposureRefineStep(nn.Module):
                 nn.Sigmoid(),
             )
 
-    def forward(self, rgb, ll_origin, light_inr, ev_feat, step_feat, use_adaptive_residual=True):
+    def forward(self, rgb, ll_origin, light_inr, event_guide, step_feat, use_adaptive_residual=True):
         x_in = torch.cat([rgb, ll_origin], dim=1) if self.concat_origin else rgb
         feat = self.rgb_to_feat(x_in)
         feat = feat + self.step_to_feat(step_feat)
-        guide = self.ev_to_feat(ev_feat)
         delta_feat = self.fuse(feat, light_inr)
-        delta_feat = delta_feat + guide
+        delta_feat = delta_feat + event_guide
         out = self.feat_to_rgb(delta_feat)
         metadata = None
 
@@ -141,6 +168,9 @@ class SEENetPath2(nn.Module):
         self.exposure_ratio_max = float(getattr(SEE_config, "exposure_ratio_max", 100.0))
         self.exposure_schedule = str(getattr(SEE_config, "exposure_schedule", "linspace"))
         self.use_batch_exposure_ratio = bool(getattr(SEE_config, "use_batch_exposure_ratio", True))
+        self.refine_backbone = str(getattr(SEE_config, "refine_backbone", "conv"))
+        refine_enc = getattr(SEE_config, "refine_encoder_config", None)
+        self.refine_encoder_config = refine_enc if refine_enc is not None else SEE_config.sparse_encoder_config
 
         if self.SEE_config.position_embedding == "bayer_pattern":
             pos_channels = 4 if self.SEE_config.w_xy_coords else 2
@@ -151,16 +181,18 @@ class SEENetPath2(nn.Module):
         self.step_condition = ExposureStepCondition(C2)
         if self.use_init_head:
             self.init_rgb = nn.Conv2d(C2, 3, kernel_size=1, stride=1, padding=0, bias=False)
+        self.event_guide_proj = nn.Conv2d(C1, C2, kernel_size=1, stride=1, padding=0, bias=False)
         self.refine_step = ExposureRefineStep(
-            C1,
             C2,
-            self.SEE_config.sparse_encoder_config,
+            refine_backbone=self.refine_backbone,
+            refine_encoder_config=self.refine_encoder_config,
             concat_origin=self.concat_origin,
             adaptive_res_and_x0=self.adaptive_res_and_x0,
         )
+        enc_type = self.SEE_config.sparse_encoder_config.type
         info(
-            f"SEENetPath2: steps={self.refine_steps}, concat_origin={self.concat_origin}, "
-            f"adaptive_res_and_x0={self.adaptive_res_and_x0}, start_from_ll={self.start_from_ll}"
+            f"SEENetPath2: steps={self.refine_steps}, encoder={enc_type}, refine_backbone={self.refine_backbone}, "
+            f"concat_origin={self.concat_origin}, adaptive_res_and_x0={self.adaptive_res_and_x0}"
         )
         info(f"SEENetPath2 refine_step size: {model_size(self.refine_step)}")
 
@@ -238,6 +270,7 @@ class SEENetPath2(nn.Module):
         x1 = self.image_head(images)
         ev = self.event_head(events)
         light_inr = self.scn_1(x1, ev)
+        event_guide = self.event_guide_proj(ev)
 
         if self.start_from_ll:
             rgb = ll_origin.clone()
@@ -274,7 +307,7 @@ class SEENetPath2(nn.Module):
                 rgb,
                 ll_origin,
                 light_inr,
-                ev,
+                event_guide,
                 step_feat,
                 use_adaptive_residual=self.use_adaptive_residual,
             )
