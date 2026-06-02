@@ -72,10 +72,8 @@ MODEL:
     position_embedding_type: "learning:1x1+1x1"
     head: "original:image1x1-event1x1sigmod1x1"
     sparse_encoder_config:
-      type: "swin_transformer_decoder_block"
-      depth: 4
-      heads: 8
-      windows_size: 4
+      type: "conv"
+    refine_backbone: "conv"
     refine_steps: 2
     concat_origin: true
     adaptive_res_and_x0: true
