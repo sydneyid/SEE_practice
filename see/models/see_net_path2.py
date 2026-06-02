@@ -1,7 +1,14 @@
 """
-SEENet Path 2: prompt-free decode with K-step event-conditioned exposure refinement.
-No exposure prompt B; output is trained directly against paired normal-light GT (NL).
+SEENet Path 2: prompt-free iterative exposure refinement (ExposureDiffusion-inspired).
+
+Integrates key ideas from ExposureDiffusion (wyf0912/ExposureDiffusion):
+  - concat_origin: always condition on the original low-light frame
+  - adaptive_res_and_x0: blend direct prediction and residual path with a learned mask
+  - exposure ratio schedule + step embedding per refine iteration
+  - per-step supervision (optional adaptive step weights via loss config)
 """
+
+import math
 
 import torch
 import torch.nn as nn
@@ -18,43 +25,97 @@ from see.models.see_net import (
 from see.utils.model_size import model_size
 
 
-class ExposureRefineStep(nn.Module):
-    """One shared refinement step: RGB state + fused features + events (cross-attention)."""
+def _exposure_ratio_schedule(num_steps, ratio_max, schedule="linspace", device=None):
+    """ED-style discrete exposure ratios from 1 -> ratio_max (inclusive endpoints)."""
+    if num_steps <= 0:
+        return torch.tensor([1.0, float(ratio_max)], device=device)
+    if schedule == "linspace":
+        return torch.linspace(1.0, float(ratio_max), num_steps + 1, device=device)
+    if schedule == "logspace":
+        return torch.logspace(0.0, math.log10(float(ratio_max)), num_steps + 1, device=device)
+    raise ValueError(f"Unknown exposure schedule: {schedule}")
 
-    def __init__(self, C1, C2, sparse_encoder_config):
+
+class ExposureStepCondition(nn.Module):
+    """Embed normalized step index and log exposure ratio (ED iter conditioning)."""
+
+    def __init__(self, embed_dim):
         super().__init__()
-        self.rgb_to_feat = nn.Conv2d(3, C2, kernel_size=1, stride=1, padding=0, bias=False)
+        self.mlp = nn.Sequential(
+            nn.Linear(2, embed_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(embed_dim, embed_dim),
+        )
+
+    def forward(self, step_index, num_steps, log_ratio):
+        if not torch.is_tensor(log_ratio):
+            log_ratio = torch.tensor([math.log(max(float(log_ratio), 1.0))], dtype=torch.float32)
+        if log_ratio.dim() == 0:
+            log_ratio = log_ratio.unsqueeze(0)
+        t_val = 0.0 if num_steps <= 1 else float(step_index) / float(num_steps - 1)
+        t = torch.full((log_ratio.shape[0],), t_val, device=log_ratio.device, dtype=log_ratio.dtype)
+        feat = torch.stack([t, log_ratio], dim=-1)
+        return self.mlp(feat).unsqueeze(-1).unsqueeze(-1)
+
+
+class ExposureRefineStep(nn.Module):
+    """
+    One refinement step: current RGB + optional LL anchor + step embed,
+    fused with SEE sparse features and events.
+    """
+
+    def __init__(self, C1, C2, sparse_encoder_config, concat_origin=True, adaptive_res_and_x0=True):
+        super().__init__()
+        self.concat_origin = concat_origin
+        self.adaptive_res_and_x0 = adaptive_res_and_x0
+        rgb_in = 6 if concat_origin else 3
+        self.rgb_to_feat = nn.Conv2d(rgb_in, C2, kernel_size=1, stride=1, padding=0, bias=False)
         self.ev_to_feat = nn.Conv2d(C1, C2, kernel_size=1, stride=1, padding=0, bias=False)
+        self.step_to_feat = nn.Conv2d(C2, C2, kernel_size=1, stride=1, padding=0, bias=False)
         cfg = sparse_encoder_config
         self.fuse = SwinTransformerDecoderBlock(
             dim=C2, depth=cfg.depth, heads=cfg.heads, windows_size=cfg.windows_size
         )
-        self.feat_to_rgb = nn.Conv2d(C2, 3, kernel_size=1, stride=1, padding=0, bias=False)
-        self.adaptive_gate = nn.Sequential(
-            nn.Conv2d(6, 16, kernel_size=3, stride=1, padding=1, bias=True),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(16, 3, kernel_size=1, stride=1, padding=0, bias=True),
-            nn.Sigmoid(),
-        )
+        out_ch = 7 if adaptive_res_and_x0 else 3
+        self.feat_to_rgb = nn.Conv2d(C2, out_ch, kernel_size=1, stride=1, padding=0, bias=False)
+        if not adaptive_res_and_x0:
+            self.adaptive_gate = nn.Sequential(
+                nn.Conv2d(6, 16, kernel_size=3, stride=1, padding=1, bias=True),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(16, 3, kernel_size=1, stride=1, padding=0, bias=True),
+                nn.Sigmoid(),
+            )
 
-    def forward(self, rgb, light_inr, ev_feat, use_adaptive_residual=True):
-        feat = self.rgb_to_feat(rgb)
+    def forward(self, rgb, ll_origin, light_inr, ev_feat, step_feat, use_adaptive_residual=True):
+        x_in = torch.cat([rgb, ll_origin], dim=1) if self.concat_origin else rgb
+        feat = self.rgb_to_feat(x_in)
+        feat = feat + self.step_to_feat(step_feat)
         guide = self.ev_to_feat(ev_feat)
         delta_feat = self.fuse(feat, light_inr)
         delta_feat = delta_feat + guide
-        delta_rgb = self.feat_to_rgb(delta_feat)
-        if use_adaptive_residual:
-            gate = self.adaptive_gate(torch.cat([rgb, delta_rgb], dim=1))
-            rgb = rgb + gate * delta_rgb
+        out = self.feat_to_rgb(delta_feat)
+        metadata = None
+
+        if self.adaptive_res_and_x0:
+            mask = torch.sigmoid(out[:, [0]])
+            x0 = out[:, 1:4].clamp(0.0, 1.0)
+            resid = out[:, 4:7]
+            out_by_resid = (resid + rgb).clamp(0.0, 1.0)
+            rgb_next = x0 * mask + out_by_resid * (1.0 - mask)
+            metadata = {"out": x0, "out_by_resid": out_by_resid, "mask": mask}
         else:
-            rgb = rgb + delta_rgb
-        return rgb
+            delta_rgb = out
+            if use_adaptive_residual:
+                gate = self.adaptive_gate(torch.cat([rgb, delta_rgb], dim=1))
+                rgb_next = rgb + gate * delta_rgb
+            else:
+                rgb_next = rgb + delta_rgb
+        return rgb_next, metadata
 
 
 class SEENetPath2(nn.Module):
     """
-    SEE-Net encoder (Bayer PE + cross-attention sparse fusion) +
-    init RGB head + K iterative exposure refinement steps (no exposure prompt).
+    SEE encoder + K-step ExposureDiffusion-style refinement (no exposure prompt B).
     """
 
     def __init__(self, frames, moments, C1, C2, loop, SEE_config):
@@ -68,9 +129,18 @@ class SEENetPath2(nn.Module):
         self.C2 = C2
         self.loop = loop
         self.SEE_config = SEE_config
-        self.refine_steps = int(getattr(SEE_config, "refine_steps", 2))
+
+        self.refine_steps = int(getattr(SEE_config, "refine_steps", 3))
+        self.concat_origin = bool(getattr(SEE_config, "concat_origin", True))
+        self.adaptive_res_and_x0 = bool(getattr(SEE_config, "adaptive_res_and_x0", True))
         self.use_adaptive_residual = bool(getattr(SEE_config, "use_adaptive_residual", True))
-        self.supervise_intermediate = bool(getattr(SEE_config, "supervise_intermediate", False))
+        self.start_from_ll = bool(getattr(SEE_config, "start_from_ll", True))
+        self.use_init_head = bool(getattr(SEE_config, "use_init_head", True))
+        self.exposure_state_update = bool(getattr(SEE_config, "exposure_state_update", False))
+        self.supervise_intermediate = bool(getattr(SEE_config, "supervise_intermediate", True))
+        self.exposure_ratio_max = float(getattr(SEE_config, "exposure_ratio_max", 100.0))
+        self.exposure_schedule = str(getattr(SEE_config, "exposure_schedule", "linspace"))
+        self.use_batch_exposure_ratio = bool(getattr(SEE_config, "use_batch_exposure_ratio", True))
 
         if self.SEE_config.position_embedding == "bayer_pattern":
             pos_channels = 4 if self.SEE_config.w_xy_coords else 2
@@ -78,9 +148,20 @@ class SEENetPath2(nn.Module):
 
         self.image_head, self.event_head = self._build_event_image_heads()
         self.scn_1 = _SparseEncoder(C1, C2, loop, sparse_encoder_config=self.SEE_config.sparse_encoder_config)
-        self.init_rgb = nn.Conv2d(C2, 3, kernel_size=1, stride=1, padding=0, bias=False)
-        self.refine_step = ExposureRefineStep(C1, C2, self.SEE_config.sparse_encoder_config)
-        info(f"SEENetPath2: refine_steps={self.refine_steps}, adaptive_residual={self.use_adaptive_residual}")
+        self.step_condition = ExposureStepCondition(C2)
+        if self.use_init_head:
+            self.init_rgb = nn.Conv2d(C2, 3, kernel_size=1, stride=1, padding=0, bias=False)
+        self.refine_step = ExposureRefineStep(
+            C1,
+            C2,
+            self.SEE_config.sparse_encoder_config,
+            concat_origin=self.concat_origin,
+            adaptive_res_and_x0=self.adaptive_res_and_x0,
+        )
+        info(
+            f"SEENetPath2: steps={self.refine_steps}, concat_origin={self.concat_origin}, "
+            f"adaptive_res_and_x0={self.adaptive_res_and_x0}, start_from_ll={self.start_from_ll}"
+        )
         info(f"SEENetPath2 refine_step size: {model_size(self.refine_step)}")
 
     def _build_event_image_heads(self):
@@ -135,9 +216,16 @@ class SEENetPath2(nn.Module):
             return image_head, event_head
         raise ValueError(f"Unknown head: {self.SEE_config.head}")
 
+    def _batch_exposure_max(self, ll, nl):
+        ll_mean = ll.mean(dim=(1, 2, 3), keepdim=True).clamp(min=1e-4)
+        nl_mean = nl.mean(dim=(1, 2, 3), keepdim=True).clamp(min=1e-4)
+        ratio = (nl_mean / ll_mean).clamp(min=1.0, max=self.exposure_ratio_max)
+        return ratio.squeeze(-1).squeeze(-1).squeeze(-1)
+
     def forward(self, batch):
         events = batch[ELB.E]
         images = batch[ELB.LL]
+        ll_origin = images[:, :3]
         B, _, H, W = images.shape
 
         if self.SEE_config.position_embedding == "bayer_pattern":
@@ -151,15 +239,56 @@ class SEENetPath2(nn.Module):
         ev = self.event_head(events)
         light_inr = self.scn_1(x1, ev)
 
-        rgb = self.init_rgb(light_inr)
-        intermediates = [rgb]
-        for _ in range(self.refine_steps):
-            rgb = self.refine_step(
-                rgb, light_inr, ev, use_adaptive_residual=self.use_adaptive_residual
+        if self.start_from_ll:
+            rgb = ll_origin.clone()
+        else:
+            rgb = torch.zeros_like(ll_origin)
+        if self.use_init_head:
+            rgb = (rgb + self.init_rgb(light_inr)).clamp(0.0, 1.0)
+
+        if self.use_batch_exposure_ratio and ELB.NL in batch:
+            ratio_max = self._batch_exposure_max(ll_origin, batch[ELB.NL])
+        else:
+            ratio_max = torch.full((B,), self.exposure_ratio_max, device=images.device, dtype=torch.float32)
+
+        intermediates = []
+        metadata_list = []
+        device = images.device
+
+        for step_i in range(self.refine_steps):
+            r_curr = []
+            r_next = []
+            for b in range(B):
+                sched = _exposure_ratio_schedule(
+                    self.refine_steps, float(ratio_max[b].item()), self.exposure_schedule, device=device
+                )
+                r_curr.append(sched[step_i])
+                r_next.append(sched[step_i + 1])
+            r_curr_t = torch.tensor(r_curr, device=device, dtype=torch.float32)
+            r_next_t = torch.tensor(r_next, device=device, dtype=torch.float32)
+            log_r = torch.log(r_next_t.clamp(min=1.0))
+            step_feat = self.step_condition(step_i, self.refine_steps, log_r)
+            step_feat = step_feat.expand(B, self.C2, H, W)
+
+            rgb, meta = self.refine_step(
+                rgb,
+                ll_origin,
+                light_inr,
+                ev,
+                step_feat,
+                use_adaptive_residual=self.use_adaptive_residual,
             )
             intermediates.append(rgb)
+            if meta is not None:
+                metadata_list.append(meta)
+
+            if self.exposure_state_update and step_i + 1 < self.refine_steps:
+                alpha = ((r_next_t - r_curr_t) / ratio_max.clamp(min=1.0)).view(B, 1, 1, 1)
+                rgb = (ll_origin * (1.0 - alpha) + rgb * alpha).clamp(0.0, 1.0)
 
         batch[ELB.PRD] = rgb
-        if self.training and self.supervise_intermediate:
-            batch["PRD_INTERMEDIATE"] = torch.stack(intermediates[1:], dim=1)
+        if self.training and self.supervise_intermediate and intermediates:
+            batch["PRD_INTERMEDIATE"] = torch.stack(intermediates, dim=1)
+        if metadata_list and self.adaptive_res_and_x0:
+            batch["PRD_REFINE_METADATA"] = metadata_list
         return batch

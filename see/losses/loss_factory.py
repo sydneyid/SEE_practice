@@ -3,6 +3,7 @@ from torch import nn
 from torch.nn.modules.loss import _Loss
 
 from see.datasets.basic_batch import EVENT_LOW_LIGHT_BATCH as ELB
+from see.losses.iterative_refinement_loss import IterativeRefinementLoss
 from see.losses.image_loss import (
     ColorConstancyRegularization,
     ExposureControlRegularization,
@@ -29,6 +30,8 @@ def get_single_loss(config):
         return IlluminationSmoothnessRegularization()
     elif config.NAME == "see_net_more-sample-constraints":
         return SEEMoreSampleConstraint(config)
+    elif config.NAME == "iterative_refinement_loss":
+        return IterativeRefinementLoss(config)
     else:
         raise ValueError(f"Unknown loss: {config.NAME}")
 
@@ -41,6 +44,8 @@ class EventLowLightBatchLoss(_Loss):
 
     def forward(self, batch):
         if self.loss_or_regularization == "loss":
+            if isinstance(self.loss, IterativeRefinementLoss):
+                return self.loss(batch)
             return self.loss(batch[ELB.NL], batch[ELB.PRD])
         elif self.loss_or_regularization == "selfconstraints":
             return self.loss(batch[ELB.LL], batch[ELB.PRD])

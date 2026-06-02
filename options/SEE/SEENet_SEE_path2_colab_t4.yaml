@@ -1,11 +1,11 @@
-# SEENet Path 2 + ExposureDiffusion-style iterative refinement (no exposure prompt B).
-# Train with: python see/main.py --yaml_file=options/SEE/SEENet_SEE_path2.yaml ...
+# Path2 + ExposureDiffusion-style refinement — T4-friendly (batch 1, 2 refine steps).
+# python see/main.py --yaml_file=options/SEE/SEENet_SEE_path2_colab_t4.yaml --TRAIN_BATCH_SIZE=1 ...
 
-JOBS: 24
+JOBS: 4
 TEST_ONLY: false
 LOG_INTERVAL: 10
-TRAIN_BATCH_SIZE: 2
-VAL_BATCH_SIZE: 2
+TRAIN_BATCH_SIZE: 1
+VAL_BATCH_SIZE: 1
 START_EPOCH: 0
 END_EPOCH: 20
 VAL_INTERVAL: 1
@@ -26,13 +26,13 @@ OPTIMIZER:
 LOSS:
   - NAME: iterative_refinement_loss
     WEIGHT: 1
-    refine_steps: 3
+    refine_steps: 2
     adaptive_loss: false
     aux_loss: true
     aux_weight: 0.25
     step_weight_schedule: increasing
   - NAME: gradient_loss
-    WEIGHT: 1
+    WEIGHT: 0.5
 METRICS:
   - NAME: PSNR
   - NAME: PSNR-Linear_N
@@ -76,19 +76,14 @@ MODEL:
       depth: 4
       heads: 8
       windows_size: 4
-    # ExposureDiffusion-inspired refinement
-    refine_steps: 3
+    refine_steps: 2
     concat_origin: true
     adaptive_res_and_x0: true
     start_from_ll: true
     use_init_head: true
-    exposure_state_update: false
-    exposure_ratio_max: 100.0
-    exposure_schedule: linspace
-    use_batch_exposure_ratio: true
     supervise_intermediate: true
 VISUALIZATION:
   folder: ./vis
-  tag: SEENetPath2-ED
+  tag: SEENetPath2-ED-colab
   intermediate_visualization: false
   ONLY_VIS: false

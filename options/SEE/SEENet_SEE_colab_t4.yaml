@@ -1,11 +1,12 @@
-# SEENet Path 2 + ExposureDiffusion-style iterative refinement (no exposure prompt B).
-# Train with: python see/main.py --yaml_file=options/SEE/SEENet_SEE_path2.yaml ...
+# Colab T4 (~16 GB VRAM): same training recipe as paper except batch size 1.
+# Paper: Adam 2e-4, 20 epochs on SEE-600K, batch 2 on HPC, random crop + flips (in dataset code).
+# HPC batch 2 -> use TRAIN_BATCH_SIZE 1 on T4; effective batch can be doubled with accumulation (not built in).
 
-JOBS: 24
+JOBS: 2
 TEST_ONLY: false
 LOG_INTERVAL: 10
-TRAIN_BATCH_SIZE: 2
-VAL_BATCH_SIZE: 2
+TRAIN_BATCH_SIZE: 1
+VAL_BATCH_SIZE: 1
 START_EPOCH: 0
 END_EPOCH: 20
 VAL_INTERVAL: 1
@@ -20,17 +21,12 @@ SEED: 9527
 IS_CUDA: true
 OPTIMIZER:
   NAME: Adam
-  LR: 0.0001
+  LR: 0.0002
   LR_SCHEDULER: cosine
   end_epoch: 20
 LOSS:
-  - NAME: iterative_refinement_loss
+  - NAME: l1_charbonnier_loss
     WEIGHT: 1
-    refine_steps: 3
-    adaptive_loss: false
-    aux_loss: true
-    aux_weight: 0.25
-    step_weight_schedule: increasing
   - NAME: gradient_loss
     WEIGHT: 1
 METRICS:
@@ -40,8 +36,6 @@ METRICS:
 DATASET:
   NAME: see_everything_everytime_dataset
   root: ./SEE-600K/RoboticArm/
-  train_scenario_filter: indoor
-  val_scenario_filter: indoor
   in_frames: 1
   crop_h: 128
   crop_w: 256
@@ -60,35 +54,31 @@ DATASET:
     - "low-normal"
     - "normal-normal"
 MODEL:
-  NAME: SEENetPath2
+  NAME: SEENet
   input_frames: 1
   event_moments: 64
   C1: 96
   C2: 96
   loop: 10
+  exposure_sample_num: 0
   SEE_config:
     position_embedding: "bayer_pattern"
     w_xy_coords: true
     position_embedding_type: "learning:1x1+1x1"
     head: "original:image1x1-event1x1sigmod1x1"
+    ExposureDecoder: "Release-1"
+    exposure_embedding_type: "learning:1x1+1x1"
+    exposure_mlp_layers: 5
+    exposure_using_cascade_embedding: True
+    is_inr_normal_feature: False
+    exposure_embedding_method: "ADD"
     sparse_encoder_config:
       type: "swin_transformer_decoder_block"
       depth: 4
       heads: 8
       windows_size: 4
-    # ExposureDiffusion-inspired refinement
-    refine_steps: 3
-    concat_origin: true
-    adaptive_res_and_x0: true
-    start_from_ll: true
-    use_init_head: true
-    exposure_state_update: false
-    exposure_ratio_max: 100.0
-    exposure_schedule: linspace
-    use_batch_exposure_ratio: true
-    supervise_intermediate: true
 VISUALIZATION:
   folder: ./vis
-  tag: SEENetPath2-ED
+  tag: SEENet-SEE-colab-t4
   intermediate_visualization: false
   ONLY_VIS: false
