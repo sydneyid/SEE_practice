@@ -95,10 +95,40 @@ class ParallelLaunch:
                     new_state_dict[name] = v
                 checkpoint["state_dict"] = new_state_dict
 
+            last_completed = int(checkpoint["epoch"])
+            info(
+                f"Resume checkpoint: {self.config.RESUME.PATH} "
+                f"(saved after completing epoch {last_completed})"
+            )
+
             if self.config.RESUME.SET_EPOCH:
-                self.config.START_EPOCH = checkpoint["epoch"]
-                opt.optimizer.load_state_dict(checkpoint["optimizer"])
-                opt.scheduler.load_state_dict(checkpoint["scheduler"])
+                # New checkpoints include next_epoch; older ones only store last completed.
+                if "next_epoch" in checkpoint:
+                    self.config.START_EPOCH = int(checkpoint["next_epoch"])
+                else:
+                    self.config.START_EPOCH = last_completed + 1
+                info(
+                    f"RESUME_SET_EPOCH: START_EPOCH={self.config.START_EPOCH} "
+                    f"(END_EPOCH={self.config.END_EPOCH})"
+                )
+                if self.config.START_EPOCH >= self.config.END_EPOCH:
+                    raise ValueError(
+                        f"Checkpoint already at or past END_EPOCH: "
+                        f"last_completed={last_completed}, END_EPOCH={self.config.END_EPOCH}"
+                    )
+                if "optimizer" in checkpoint:
+                    opt.optimizer.load_state_dict(checkpoint["optimizer"])
+                else:
+                    info("Resume: checkpoint has no optimizer state; using fresh optimizer.")
+                if "scheduler" in checkpoint:
+                    opt.scheduler.load_state_dict(checkpoint["scheduler"])
+                else:
+                    info("Resume: checkpoint has no scheduler state; using fresh scheduler.")
+            else:
+                info(
+                    f"RESUME_SET_EPOCH=False: loading weights only; "
+                    f"START_EPOCH stays {self.config.START_EPOCH}"
+                )
 
             if self.config.RESUME_STRICT:
                 model.load_state_dict(checkpoint["state_dict"])
@@ -148,6 +178,7 @@ class ParallelLaunch:
             # save checkpoint
             checkpoint = {
                 "epoch": epoch,
+                "next_epoch": epoch + 1,
                 "state_dict": model.state_dict(),
                 "optimizer": opt.optimizer.state_dict(),
                 "scheduler": opt.scheduler.state_dict(),
