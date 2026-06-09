@@ -25,6 +25,7 @@ flags.DEFINE_boolean("RESUME_STRICT", True, "The RESUME_STRICT.")
 flags.DEFINE_boolean("TEST_ONLY", False, "The test only.")
 flags.DEFINE_boolean("PUDB", False, "The debug switch.")
 flags.DEFINE_boolean(f"VISUALIZE", False, "The visualization switch.")
+flags.DEFINE_string("VIS_ZIP_PATH", None, "After TEST_ONLY+VISUALIZE, zip vis folder to this .zip path (e.g. on Drive).")
 #
 flags.DEFINE_integer(f"TRAIN_BATCH_SIZE", None, "The train batch size.")
 flags.DEFINE_integer(f"VAL_BATCH_SIZE", None, "The test batch size.")
@@ -55,6 +56,11 @@ def init_config(yaml_path):
         config["RESUME"]["SET_EPOCH"] = FLAGS.RESUME_SET_EPOCH
     # 3. VISUALIZATION
     config["VISUALIZE"] = FLAGS.VISUALIZE
+    if FLAGS.VIS_ZIP_PATH:
+        vis_zip = os.path.abspath(os.path.expanduser(FLAGS.VIS_ZIP_PATH.strip()))
+        config.setdefault("VISUALIZATION", {})
+        config["VISUALIZATION"]["zip_path"] = vis_zip
+        info(f"VIS_ZIP_PATH: {vis_zip}")
     # 4. Update batch size
     if FLAGS.TRAIN_BATCH_SIZE:
         info(f"Update TRAIN_BATCH_SIZE to {FLAGS.TRAIN_BATCH_SIZE}")

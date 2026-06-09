@@ -6,13 +6,13 @@ import random
 import shutil
 import time
 from collections import OrderedDict
-from os.path import isfile, join
+from os.path import isdir, isfile, join, splitext
 
 import cv2
 import numpy as np
 import torch
 import torch.nn as nn
-from absl.logging import debug, flags, info
+from absl.logging import debug, flags, info, warn
 from pudb import set_trace
 from torch.testing._internal.common_quantization import AverageMeter
 from torch.utils.data import DataLoader
@@ -167,6 +167,8 @@ class ParallelLaunch:
                     "Extract TESTING_GROUPS under DATASET.root (see see_dataset.py)."
                 )
             self.valid(val_loader, model, criterion, metrics, 0)
+            if self.config.VISUALIZE:
+                self._maybe_zip_visualizations()
             return
         has_val = len(val_dataset) > 0
         if not has_val:
@@ -201,6 +203,35 @@ class ParallelLaunch:
                     f"checkpoint-{str(epoch).zfill(3)}.pth.tar",
                 )
                 torch.save(checkpoint, path)
+
+    def _vis_output_dir(self):
+        vis_folder = self.config.VISUALIZATION.folder
+        if vis_folder.startswith("./"):
+            vis_folder = vis_folder[2:]
+        return join(FLAGS.log_dir, vis_folder)
+
+    def _maybe_zip_visualizations(self):
+        vis_root = self._vis_output_dir()
+        zip_path = getattr(self.config.VISUALIZATION, "zip_path", None)
+        if not zip_path:
+            info(f"Visualizations saved under: {vis_root}")
+            return
+        if not isdir(vis_root):
+            warn(f"VIS zip skipped: vis folder not found: {vis_root}")
+            return
+        zip_path = os.path.abspath(zip_path)
+        os.makedirs(os.path.dirname(zip_path), exist_ok=True)
+        archive_base, ext = splitext(zip_path)
+        if ext.lower() != ".zip":
+            archive_base = zip_path
+            zip_path = archive_base + ".zip"
+        if isfile(zip_path):
+            os.remove(zip_path)
+        parent = os.path.dirname(vis_root)
+        folder_name = os.path.basename(vis_root)
+        info(f"Zipping {vis_root} -> {zip_path}")
+        shutil.make_archive(archive_base, "zip", root_dir=parent, base_dir=folder_name)
+        info(f"Saved visualization zip: {zip_path}")
 
     def train(self, train_loader, model, criterion, metrics, opt, epoch):
         model = model.train()
