@@ -38,6 +38,8 @@ DATASET:
   root: /content/drive/MyDrive/SEE_Dataset
   train_scenario_filter: indoor
   val_scenario_filter: indoor
+  train_group_name_filter: normalized
+  val_group_name_filter: all
   in_frames: 1
   crop_h: 128
   crop_w: 256

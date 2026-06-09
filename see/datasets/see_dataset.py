@@ -1,6 +1,7 @@
 import json
 import os
 import random
+import re
 import sys
 from datetime import timedelta
 from os import listdir
@@ -20,6 +21,9 @@ from tqdm import tqdm
 from see.datasets.basic_batch import EVENT_LOW_LIGHT_BATCH as ELBC
 from see.datasets.basic_batch import get_ev_low_light_batch
 from see.utils.event_representation_builder import EventRepresentationBuilder
+
+# NNN-indoor / NNN-outdoor (no suffix variants like 072-indoor-Checkerboard).
+NORMALIZED_GROUP_RE = re.compile(r"^\d{3}-(indoor|outdoor)$")
 
 
 class _EmptyDataset(Dataset):
@@ -229,10 +233,74 @@ class SeeEverythingEveryTimePairedVideoDataset(Dataset):
         return frame, frame_blur, frame_illmap
 
 
+def _cross_exposure_pairs(inputs, outputs, tag):
+    if not inputs or not outputs:
+        return []
+    return [(inp, out, tag) for inp in inputs for out in outputs]
+
+
+def _same_exposure_pairs(videos, tag, allow_self_pair=False):
+    if not videos:
+        return []
+    pairs = []
+    for i, v_in in enumerate(videos):
+        for j, v_out in enumerate(videos):
+            if allow_self_pair or i != j:
+                pairs.append((v_in, v_out, tag))
+    return pairs
+
+
+def _collect_mapping_pairs(normal_list, low_list, high_list, mapping_type, allow_self_pair=False):
+    pairs = []
+    for mapping in mapping_type:
+        if mapping == "low-normal":
+            pairs.extend(_cross_exposure_pairs(low_list, normal_list, "low-normal"))
+        elif mapping == "high-normal":
+            pairs.extend(_cross_exposure_pairs(high_list, normal_list, "high-normal"))
+        elif mapping == "low-high":
+            pairs.extend(_cross_exposure_pairs(low_list, high_list, "low-high"))
+        elif mapping == "high-low":
+            pairs.extend(_cross_exposure_pairs(high_list, low_list, "high-low"))
+        elif mapping == "normal-normal":
+            pairs.extend(_same_exposure_pairs(normal_list, "normal-normal", allow_self_pair))
+        elif mapping == "low-low":
+            pairs.extend(_same_exposure_pairs(low_list, "low-low", allow_self_pair))
+        elif mapping == "high-high":
+            pairs.extend(_same_exposure_pairs(high_list, "high-high", allow_self_pair))
+    return pairs
+
+
+def _fallback_mapping_types(normal_list, low_list, high_list):
+    """Mappings that can work with whichever exposure buckets are non-empty."""
+    fallbacks = []
+    if low_list and normal_list:
+        fallbacks.append("low-normal")
+    if high_list and normal_list:
+        fallbacks.append("high-normal")
+    if low_list and high_list:
+        fallbacks.extend(["low-high", "high-low"])
+    if len(normal_list) >= 1:
+        fallbacks.append("normal-normal")
+    if len(low_list) >= 1:
+        fallbacks.append("low-low")
+    if len(high_list) >= 1:
+        fallbacks.append("high-high")
+    # preserve order, dedupe
+    seen = set()
+    ordered = []
+    for m in fallbacks:
+        if m not in seen:
+            seen.add(m)
+            ordered.append(m)
+    return ordered
+
+
 def get_see_everything_everytime_with_event_dataset_for_each_group(
     group_folder, in_frames, crop_h, crop_w, ev_rep_cfg, is_training, mapping_type, sample_step
 ):
     def _get_dataset_by_in_out_video_name(input_video, normal_video, input_exposure_states):
+        if input_video not in video_to_frame_events or normal_video not in video_to_frame_events:
+            return None
         sample = SeeEverythingEveryTimePairedVideoDataset(
             group_folder,
             input_video,
@@ -247,102 +315,152 @@ def get_see_everything_everytime_with_event_dataset_for_each_group(
             input_exposure_states=input_exposure_states,
             sample_step=sample_step,
         )
+        if len(sample) == 0:
+            return None
         return sample
+
+    def _append_pairs(pairs):
+        seen = set()
+        for input_video, output_video, tag in pairs:
+            key = (input_video, output_video, tag)
+            if key in seen:
+                continue
+            seen.add(key)
+            sample = _get_dataset_by_in_out_video_name(input_video, output_video, tag)
+            if sample is not None:
+                dataset.append(sample)
 
     with open(join(group_folder, "registrate_result.json"), "r") as f:
         registrate_result = json.load(f)
+    video_to_frame_events = _build_video_to_frame_events(group_folder, registrate_result)
+
+    with open(join(group_folder, "exposure_state.json"), "r") as f:
+        exposure_state = json.load(f)
+    normal_video_list, lowlight_video_list, highlight_video_list = _classify_videos_by_exposure(
+        exposure_state, video_to_frame_events
+    )
+
+    any_videos = normal_video_list or lowlight_video_list or highlight_video_list
+    if not any_videos:
+        return [], "no videos with aligned frame_event data"
+
+    dataset = []
+    used_fallback = False
+
+    # 1) Requested mappings — skip cross-types when either side is empty; allow self-pairs if only one video in bucket.
+    primary_pairs = _collect_mapping_pairs(
+        normal_video_list,
+        lowlight_video_list,
+        highlight_video_list,
+        mapping_type,
+        allow_self_pair=True,
+    )
+    _append_pairs(primary_pairs)
+
+    # 2) If nothing matched (e.g. normal=0 or low=0 blocked all yaml mappings), use any feasible mapping.
+    if len(dataset) == 0:
+        used_fallback = True
+        fallback_types = _fallback_mapping_types(
+            normal_video_list, lowlight_video_list, highlight_video_list
+        )
+        fallback_pairs = _collect_mapping_pairs(
+            normal_video_list,
+            lowlight_video_list,
+            highlight_video_list,
+            fallback_types,
+            allow_self_pair=True,
+        )
+        _append_pairs(fallback_pairs)
+
+    if len(dataset) == 0:
+        reason = (
+            f"exposure counts (with data): low={len(lowlight_video_list)}, "
+            f"high={len(highlight_video_list)}, normal={len(normal_video_list)}; "
+            f"mapping={mapping_type}"
+        )
+        return [], reason
+
+    if used_fallback:
+        info(
+            f"Group {group_folder.split('/')[-1]}: used fallback mappings "
+            f"(low={len(lowlight_video_list)}, high={len(highlight_video_list)}, "
+            f"normal={len(normal_video_list)}) -> {len(dataset)} pair(s)"
+        )
+    return dataset, None
+
+
+def _normalize_exposure_label(label: str) -> str:
+    s = label.strip().lower().replace("_", "-")
+    aliases = {
+        "normallight": "normal-light",
+        "lowlight": "low-light",
+        "highlight": "high-light",
+        "highlights": "high-light",
+    }
+    return aliases.get(s.replace("-", ""), s)
+
+
+def _build_video_to_frame_events(group_folder, registrate_result):
+    """Build aligned frame/event file lists; skip videos with missing or empty frame_event."""
     video_to_frame_events = {}
     for key, value in registrate_result.items():
         start_timestamp = value["start_timestamp"]
         end_timestamp = value["end_timestamp"]
         frame_event_folder = join(group_folder, key, "frame_event")
-        # f ends with png
+        if not isdir(frame_event_folder):
+            debug(f"Skip video (no frame_event): {join(group_folder, key)}")
+            continue
         files = [f for f in listdir(frame_event_folder) if f.endswith(".png")]
         files = sorted(files)
-        # timestamp is the first number of files
         frame_event_files = [[], []]
         for f in files:
             timestamp = float(f.split("_")[0])
             if start_timestamp <= timestamp <= end_timestamp:
-                if "_vis" in f:  # events file
+                if "_vis" in f:
                     event_file_name = f.replace("_vis.png", ".npy")
-                    frame_event_files[1].append(event_file_name)
+                    npy_path = join(frame_event_folder, event_file_name)
+                    if isfile(npy_path):
+                        frame_event_files[1].append(event_file_name)
                 else:
                     frame_event_files[0].append(f)
+        length = min(len(frame_event_files[0]), len(frame_event_files[1]))
+        if length == 0:
+            debug(f"Skip video (no aligned frames/events): {join(group_folder, key)}")
+            continue
+        frame_event_files[0] = frame_event_files[0][:length]
+        frame_event_files[1] = frame_event_files[1][:length]
         video_to_frame_events[key] = frame_event_files
-    # make the dataset from lowlight or highlight to normal light
-    with open(join(group_folder, "exposure_state.json"), "r") as f:
-        exposure_state = json.load(f)
+    return video_to_frame_events
+
+
+def _classify_videos_by_exposure(exposure_state, video_to_frame_events):
+    """Only classify videos that exist in registrate_result with non-empty frame_event."""
     normal_video_list = []
     lowlight_video_list = []
     highlight_video_list = []
     for video_name, values in exposure_state.items():
-        video_exposure_state = values["exposure_state"]
+        if video_name not in video_to_frame_events:
+            continue
+        video_exposure_state = _normalize_exposure_label(values["exposure_state"])
         if video_exposure_state == "normal-light":
             normal_video_list.append(video_name)
         elif video_exposure_state == "low-light":
             lowlight_video_list.append(video_name)
         elif video_exposure_state == "high-light":
             highlight_video_list.append(video_name)
+    return normal_video_list, lowlight_video_list, highlight_video_list
 
-    if not is_training and len(normal_video_list) == 0:
-        info(f"Testing: no normal-light video in {group_folder}")
-        return []
-    # Construct dataset for low to normal
-    dataset = []
-    # 1. low-light to normal-light
-    if "low-normal" in mapping_type:
-        for input_video in lowlight_video_list:
-            for normal_video in normal_video_list:
-                sample = _get_dataset_by_in_out_video_name(input_video, normal_video, "low-normal")
-                dataset.append(sample)
-    # 2. high-light to normal-light
-    if "high-normal" in mapping_type:
-        for input_video in highlight_video_list:
-            for normal_video in normal_video_list:
-                sample = _get_dataset_by_in_out_video_name(input_video, normal_video, "high-normal")
-                dataset.append(sample)
-    # 3. low-light to high-light
-    if "low-high" in mapping_type:
-        for input_video in lowlight_video_list:
-            for output_video in highlight_video_list:
-                sample = _get_dataset_by_in_out_video_name(input_video, output_video, "low-high")
-                dataset.append(sample)
-    # 4. high-light to low-light
-    if "high-low" in mapping_type:
-        for input_video in highlight_video_list:
-            for output_video in lowlight_video_list:
-                sample = _get_dataset_by_in_out_video_name(input_video, output_video, "high-low")
-                dataset.append(sample)
-    # Construct dataset for normal-light to normal-light
-    if "normal-normal" in mapping_type:
-        normal_video_count = len(normal_video_list)
-        for i in range(normal_video_count):
-            for j in range(normal_video_count):
-                if i != j:
-                    sample = _get_dataset_by_in_out_video_name(
-                        normal_video_list[i], normal_video_list[j], "normal-normal"
-                    )
-                    dataset.append(sample)
-    if "low-low" in mapping_type:
-        low_video_count = len(lowlight_video_list)
-        for i in range(low_video_count):
-            for j in range(low_video_count):
-                if i != j:
-                    sample = _get_dataset_by_in_out_video_name(
-                        lowlight_video_list[i], lowlight_video_list[j], "low-low"
-                    )
-                    dataset.append(sample)
-    if "high-high" in mapping_type:
-        high_video_count = len(highlight_video_list)
-        for i in range(high_video_count):
-            for j in range(high_video_count):
-                if i != j:
-                    sample = _get_dataset_by_in_out_video_name(
-                        highlight_video_list[i], highlight_video_list[j], "high-high"
-                    )
-                    dataset.append(sample)
-    return dataset
+
+def is_normalized_group(group_name: str) -> bool:
+    return NORMALIZED_GROUP_RE.match(group_name) is not None
+
+
+def _group_name_matches_filter(group_name: str, group_name_filter: str | None) -> bool:
+    if group_name_filter is None or group_name_filter in ("all", ""):
+        return True
+    if group_name_filter == "normalized":
+        return is_normalized_group(group_name)
+    raise ValueError(f"Unknown group_name_filter: {group_name_filter!r} (use 'all' or 'normalized')")
 
 
 def group_numeric_id(group_name: str) -> int:
@@ -385,6 +503,8 @@ def get_see_everything_everytime_with_event_dataset_all(
     sample_step,
     train_scenario_filter=None,
     val_scenario_filter=None,
+    train_group_name_filter=None,
+    val_group_name_filter=None,
 ):
     all_train_dataset, all_test_dataset = [], []
     video_all_folder = os.path.abspath(root)
@@ -397,6 +517,11 @@ def get_see_everything_everytime_with_event_dataset_all(
         info(
             f"Scenario filters: train={train_scenario_filter or 'all'}, val={val_scenario_filter or 'all'}"
         )
+    if train_group_name_filter or val_group_name_filter:
+        info(
+            f"Group name filters: train={train_group_name_filter or 'all'}, "
+            f"val={val_group_name_filter or 'all'}"
+        )
 
     for group in sorted(listdir(video_all_folder)):
         group_folder = join(video_all_folder, group)
@@ -405,10 +530,12 @@ def get_see_everything_everytime_with_event_dataset_all(
         if group in TESTING_GROUPS:
             if not _scenario_matches_filter(group, val_scenario_filter):
                 continue
+            if not _group_name_matches_filter(group, val_group_name_filter):
+                continue
             if not _group_has_required_metadata(group_folder):
                 warn(f"Skip Group (Testing, incomplete): {group_folder}")
                 continue
-            dataset_in_one_group = get_see_everything_everytime_with_event_dataset_for_each_group(
+            dataset_in_one_group, empty_reason = get_see_everything_everytime_with_event_dataset_for_each_group(
                 group_folder,
                 in_frames,
                 crop_h,
@@ -419,16 +546,18 @@ def get_see_everything_everytime_with_event_dataset_all(
                 sample_step=sample_step,
             )
             if len(dataset_in_one_group) == 0:
-                info(f"Empty Group (Testing) : {group_folder}")
+                warn(f"Skip Group (Testing, no samples): {group_folder} — {empty_reason}")
                 continue
             all_test_dataset.extend(dataset_in_one_group)
         else:
             if not _scenario_matches_filter(group, train_scenario_filter):
                 continue
+            if not _group_name_matches_filter(group, train_group_name_filter):
+                continue
             if not _group_has_required_metadata(group_folder):
                 warn(f"Skip Group (Training, incomplete): {group_folder}")
                 continue
-            dataset_in_one_group = get_see_everything_everytime_with_event_dataset_for_each_group(
+            dataset_in_one_group, empty_reason = get_see_everything_everytime_with_event_dataset_for_each_group(
                 group_folder,
                 in_frames,
                 crop_h,
@@ -439,7 +568,7 @@ def get_see_everything_everytime_with_event_dataset_all(
                 sample_step=sample_step,
             )
             if len(dataset_in_one_group) == 0:
-                info(f"Empty Group (Training): {group_folder}")
+                warn(f"Skip Group (Training, no samples): {group_folder} — {empty_reason}")
                 continue
             all_train_dataset.extend(dataset_in_one_group)
     info(f"all_test_dataset: {len(all_test_dataset)}")

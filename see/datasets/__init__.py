@@ -26,6 +26,8 @@ def get_dataset(config):
             sample_step=config.sample_step,
             train_scenario_filter=getattr(config, "train_scenario_filter", None),
             val_scenario_filter=getattr(config, "val_scenario_filter", None),
+            train_group_name_filter=getattr(config, "train_group_name_filter", None),
+            val_group_name_filter=getattr(config, "val_group_name_filter", None),
         )
     else:
         raise ValueError(f"Unknown dataset: {config.NAME}")
