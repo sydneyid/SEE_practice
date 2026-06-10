@@ -101,7 +101,7 @@ class ParallelLaunch:
                 f"(saved after completing epoch {last_completed})"
             )
 
-            if self.config.RESUME.SET_EPOCH:
+            if self.config.RESUME.SET_EPOCH and not self.config.TEST_ONLY:
                 # New checkpoints include next_epoch; older ones only store last completed.
                 if "next_epoch" in checkpoint:
                     self.config.START_EPOCH = int(checkpoint["next_epoch"])
@@ -124,6 +124,8 @@ class ParallelLaunch:
                     opt.scheduler.load_state_dict(checkpoint["scheduler"])
                 else:
                     info("Resume: checkpoint has no scheduler state; using fresh scheduler.")
+            elif self.config.RESUME.SET_EPOCH and self.config.TEST_ONLY:
+                info("TEST_ONLY: loading checkpoint weights only (ignoring RESUME_SET_EPOCH).")
             else:
                 info(
                     f"RESUME_SET_EPOCH=False: loading weights only; "
@@ -143,6 +145,25 @@ class ParallelLaunch:
                 model.load_state_dict(model_dict, strict=False)
 
         # 2. Build Dataloader
+        if self.config.TEST_ONLY:
+            if len(val_dataset) == 0:
+                raise ValueError(
+                    "TEST_ONLY requires a non-empty validation/test dataset. "
+                    "Extract TESTING_GROUPS under DATASET.root (see see_dataset.py)."
+                )
+            val_loader = DataLoader(
+                dataset=val_dataset,
+                batch_size=self.config.VAL_BATCH_SIZE,
+                shuffle=False,
+                num_workers=self.config.JOBS,
+                pin_memory=True,
+                drop_last=True,
+            )
+            self.valid(val_loader, model, criterion, metrics, 0)
+            if self.config.VISUALIZE:
+                self._maybe_zip_visualizations()
+            return
+
         train_loader = DataLoader(
             dataset=train_dataset,
             batch_size=self.config.TRAIN_BATCH_SIZE,
@@ -159,17 +180,6 @@ class ParallelLaunch:
             pin_memory=True,
             drop_last=True,
         )
-        # 3. if test only
-        if self.config.TEST_ONLY:
-            if len(val_dataset) == 0:
-                raise ValueError(
-                    "TEST_ONLY requires a non-empty validation/test dataset. "
-                    "Extract TESTING_GROUPS under DATASET.root (see see_dataset.py)."
-                )
-            self.valid(val_loader, model, criterion, metrics, 0)
-            if self.config.VISUALIZE:
-                self._maybe_zip_visualizations()
-            return
         has_val = len(val_dataset) > 0
         if not has_val:
             info("No validation/test data; training will skip validation epochs.")
