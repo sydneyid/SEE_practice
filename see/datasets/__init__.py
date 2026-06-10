@@ -5,7 +5,7 @@ from see.datasets.sde import get_seeing_dynamic_with_event_dataset_all
 from see.datasets.see_dataset import get_see_everything_everytime_with_event_dataset_all
 
 
-def get_dataset(config):
+def get_dataset(config, test_only=False):
     if config.NAME == "seeing_dynamic_with_event":
         return get_seeing_dynamic_with_event_dataset_all(
             root=config.root,
@@ -28,6 +28,7 @@ def get_dataset(config):
             val_scenario_filter=getattr(config, "val_scenario_filter", None),
             train_group_name_filter=getattr(config, "train_group_name_filter", None),
             val_group_name_filter=getattr(config, "val_group_name_filter", None),
+            test_only=test_only,
         )
     else:
         raise ValueError(f"Unknown dataset: {config.NAME}")

@@ -66,7 +66,7 @@ class ParallelLaunch:
 
     def run(self):
         # 0. Init
-        train_dataset, val_dataset = get_dataset(self.config.DATASET)
+        train_dataset, val_dataset = get_dataset(self.config.DATASET, test_only=self.config.TEST_ONLY)
         model = get_model(self.config.MODEL)
         criterion = get_loss(self.config.LOSS)
         metrics = get_metric(self.config.METRICS)

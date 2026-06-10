@@ -505,6 +505,7 @@ def get_see_everything_everytime_with_event_dataset_all(
     val_scenario_filter=None,
     train_group_name_filter=None,
     val_group_name_filter=None,
+    test_only=False,
 ):
     all_train_dataset, all_test_dataset = [], []
     video_all_folder = os.path.abspath(root)
@@ -522,6 +523,8 @@ def get_see_everything_everytime_with_event_dataset_all(
             f"Group name filters: train={train_group_name_filter or 'all'}, "
             f"val={val_group_name_filter or 'all'}"
         )
+    if test_only:
+        info("TEST_ONLY: skipping training group scan; loading TESTING_GROUPS only.")
 
     for group in sorted(listdir(video_all_folder)):
         group_folder = join(video_all_folder, group)
@@ -550,6 +553,8 @@ def get_see_everything_everytime_with_event_dataset_all(
                 continue
             all_test_dataset.extend(dataset_in_one_group)
         else:
+            if test_only:
+                continue
             if not _scenario_matches_filter(group, train_scenario_filter):
                 continue
             if not _group_name_matches_filter(group, train_group_name_filter):
@@ -588,10 +593,15 @@ def get_see_everything_everytime_with_event_dataset_all(
                 f"No test/val samples under {video_all_folder}. "
                 "Training can continue; inference (TEST_ONLY) needs test group folders."
             )
-    if len(all_train_dataset) == 0:
+    if len(all_train_dataset) == 0 and not test_only:
         raise ValueError(
             f"No training samples under {video_all_folder}. "
             "Extract non-test RoboticArm group folders (all groups not in TESTING_GROUPS)."
+        )
+    if test_only and len(all_test_dataset) == 0:
+        raise ValueError(
+            f"TEST_ONLY: no validation/test samples under {video_all_folder}. "
+            "Extract official TESTING_GROUPS (see see_dataset.py)."
         )
     return _concat_or_empty(all_train_dataset), _concat_or_empty(all_test_dataset)
 
